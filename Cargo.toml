@@ -1,0 +1,13 @@
+[package]
+name = "local_regex"
+version = "0.1.0"
+edition = "2021"
+description = "A self-contained local regex engine: hand-written parser, Thompson NFA construction, and Pike-VM style simulation. No external regex engine, no external services, zero dependencies."
+
+[lib]
+name = "local_regex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "verify_regex"
+path = "src/bin/verify_regex.rs"

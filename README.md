@@ -1,98 +1,108 @@
-# Local Image Pyramid & Tile Generator
+# local_regex — 本地正则表达式匹配引擎
 
-一个纯本地的图像金字塔与切片工具：所有输入图片、缩放层、tile、manifest
-和缓存只存放在本地文件或内存中，**不依赖地图服务器、CDN、云存储或任何
-外部服务**。
+一个完全本地、零依赖的 Rust 正则表达式引擎。pattern 解析、NFA 构造与匹配核心全部自行实现：
 
-## 功能
+- **不调用**系统 regex 引擎、PCRE 或任何外部服务；
+- **零第三方 crate 依赖**（`Cargo.toml` 中没有任何 dependencies）；
+- 所有 pattern、自动机、输入数据与测试用例只存在于本地文件或内存中。
 
-- 读取常见 PNG / JPEG（经 Pillow 解码，统一转为 RGB）。
-- 按配置逐级缩小生成 image pyramid，直到达到最小尺寸。
-- 每级按固定 tile size 切片，边缘 tile 采用**裁剪**规则（见下文）。
-- 支持 `nearest` 与 `bilinear` 两种缩放方式，实现基于 numpy 纯 float64
-  运算，相同输入保证得到逐字节稳定的结果。
-- 生成 `manifest.json`，记录原图尺寸、层级、tile 坐标、尺寸与 SHA-256 哈希。
-- 增量重建：输入与配置未变化时不重复生成任何 tile；损坏或缺失的 tile
-  会被自动重新生成。
-- 所有写入经由临时文件 + `os.replace` 原子替换，manifest 最后写入，
-  生成中断不会留下被 manifest 误认为有效的半文件。
+## 支持的语法
 
-## 层级算法
+| 语法 | 含义 |
+| --- | --- |
+| `a` | 普通字符（字面量） |
+| `.` | 任意单个字符（含 `\n`） |
+| `ab` | 连接 |
+| `a\|b` | 交替 |
+| `a*` `a+` `a?` | 重复（贪婪）；每个原子最多跟一个量词，`a**` 报错 |
+| `( ... )` | 分组，可嵌套，如 `(a*b?)+` |
+| `[abc]` `[a-z]` `[^0-9]` | 字符类；`[a-]`/`[-a]` 中 `-` 为字面量；`[\d]` 等简写可出现在类中 |
+| `\d` `\w` `\s` `\D` `\W` `\S` | 简写字符类（取反形式不允许出现在 `[...]` 内） |
+| `\.` `\\` `\*` 等 | 非字母数字字符转义后按字面量匹配 |
+| `\n` `\t` `\r` `\f` `\v` `\0` | 控制字符转义 |
 
-- Level 0 为原图，尺寸 `(W, H)`。
-- 每一级宽高各减半（向上取整，最小为 1）：
-  `w' = max(1, ceil(w/2))`，`h' = max(1, ceil(h/2))`。
-- 当 `max(w, h) <= min_size`（默认 256）时停止，该级为最后一级。
-- 例：`333x257`、`min_size=32` →
-  `333x257 → 167x129 → 84x65 → 42x33 → 21x17`。
+优先级（由松到紧）：交替 `|` < 连接 < 量词 `* + ?` < 分组/原子。
 
-## 坐标与切片规则
+## 匹配模式
 
-- tile 尺寸固定为 `tile_size`（默认 256）。
-- tile 坐标 `(tx, ty)` 从 0 开始，原点在图像左上角；
-  像素偏移为 `(tx * tile_size, ty * tile_size)`。
-- **边缘规则：裁剪（crop），不 padding。** 最右/最下列不足一个完整
-  tile 时，tile 只保存真实内容，实际宽高记录在 manifest 的
-  `width`/`height` 字段中。
-- 存储路径：`tiles/<level>/<tx>/<ty>.png`，一律使用无损 PNG 编码。
+两种模式语义明确区分：
 
-## Manifest
+- **Full match** — `Regex::is_full_match(text)`：pattern 必须消耗**整个**输入。
+- **Search** — `Regex::search(text)`：在输入任意位置寻找匹配，返回
+  `Some((start, end))`（0 起始的字符下标，左闭右开）。语义为
+  **leftmost-first**（Perl 风格）：起始位置最靠左的匹配获胜；同一起始位置时，
+  结果与贪婪回溯引擎找到的第一个匹配一致（量词贪婪、交替分支按书写顺序优先）。
+  空匹配合法：`a*` 在 `"bbb"` 上报告 `(0, 0)`。
 
-`manifest.json` 结构：
+## 实现结构
 
-```json
-{
-  "version": 1,
-  "source": {"path": "...", "sha256": "...", "width": 769, "height": 513},
-  "config": {"tile_size": 256, "min_size": 256, "resample": "bilinear"},
-  "levels": [
-    {
-      "level": 0, "width": 769, "height": 513, "tiles_x": 4, "tiles_y": 3,
-      "tiles": [
-        {"x": 0, "y": 0, "width": 256, "height": 256,
-         "path": "tiles/0/0/0.png", "sha256": "..."}
-      ]
-    }
-  ]
-}
+```
+src/
+├── ast.rs    — AST 定义（Literal / AnyChar / Class / Concat / Alt / Repeat / Empty）
+├── parser.rs — 递归下降 parser，pattern 字符串 -> AST
+├── nfa.rs    — Thompson construction，AST -> NFA 指令程序
+├── vm.rs     — Pike VM 多状态模拟（匹配核心）
+├── lib.rs    — Regex 公开 API
+└── bin/verify_regex.rs — 独立终端测试程序
 ```
 
-## 增量重建与原子写
+**解析**：递归下降，文法为 `alt := concat ('|' concat)*`，
+`concat := repeat*`，`repeat := atom quantifier?`。所有解析错误都携带
+0 起始的字符位置，包括：未闭合括号 `(`、多余 `)`、量词缺少操作数（`*abc`）、
+量词叠用（`a**`）、未闭合字符类 `[abc`、空字符类 `[]`、非法区间 `[z-a]`、
+末尾悬空 `\`、非法转义 `\q`。
 
-- 每次构建先计算源文件 SHA-256 并与 manifest 比对；源或配置变化时
-  全部重建，否则逐 tile 校验「文件存在 + 哈希匹配」，只重新生成
-  损坏、缺失或哈希不符的 tile。
-- tile 与 manifest 均先写入同目录临时文件（`.tmp-*`）再 `os.replace`
-  原子替换；manifest 最后写入。构建中断时 manifest 不会引用任何
-  半文件，残留的 `.tmp-*` 会在下次运行时自动清理。
+**NFA 构造（Thompson construction）**：AST 编译为扁平指令序列
+`Char / Any / Class / Split / Jmp / Match`。epsilon 转移由 `Split`（二选一）
+与 `Jmp`（无条件跳转）表示；空字符串、空分支（`a|`、`()`）编译为纯 epsilon
+路径。程序只有一个接受态（末尾的 `Match`）。
 
-## 使用
+**匹配（Pike VM）**：不回溯，而是维护每个输入位置上所有可达 NFA 状态的
+**集合**，线程按优先级排序（复现 leftmost-first 语义），每个线程携带起始位置
+以报告匹配区间。epsilon 闭包用显式栈迭代计算，并用代际标记去重——
+`(a*)*` 这类 epsilon 环不会死循环，深嵌套 pattern 也不会爆栈。
 
-```bash
-# 构建
-python -m pyramid.cli input.png -o out/ --tile-size 256 --min-size 256 --resample bilinear
+## 复杂度
 
-# 校验已有输出（manifest + 全部 tile 哈希）
-python -m pyramid.cli -o out/ --validate
-```
+设 NFA 程序大小为 `m`（与 pattern 长度成正比），输入长度为 `n`：
 
-Python API：
-
-```python
-from pyramid import PyramidConfig, build_pyramid, validate_output
-
-stats = build_pyramid("input.png", "out/",
-                      PyramidConfig(tile_size=256, min_size=256, resample="bilinear"))
-problems = validate_output("out/")  # 空列表表示全部有效
-```
+- 时间：**O(m · n)** 最坏情况，与 pattern 结构无关——不存在指数级回溯，
+  `(a+)+b`、`(a|a)*`、`a?^N a^N` 等"灾难性" pattern 都在多项式时间内完成；
+- 空间：**O(m)**（两个线程集合 + 访问标记）；
+- 编译：**O(m)**。
 
 ## 测试
 
+不使用 `cargo test`，而是通过独立测试程序逐项输出 PASS/FAIL：
+
 ```bash
-python -m pytest tests/ -v -s
+cargo run --bin verify_regex            # 运行完整测试套件
+cargo run --release --bin verify_regex  # 优化构建（长输入性能测试更快）
 ```
 
-测试在终端运行并输出校验结果，不打开任何图片窗口。测试图像由代码以
-固定种子生成，覆盖：奇数尺寸、边缘 tile 裁剪、nearest/bilinear 两种
-缩放及其确定性、增量重建（未变化时零重写）、tile 损坏/缺失/manifest
-被篡改后的重新生成、写入中途崩溃的恢复与临时文件清理。
+覆盖内容：运算符优先级、字面量与 `.`、空 pattern 与空匹配、字符类（区间/
+取反/转义/简写）、重复与嵌套量词、full match 与 search 语义区分、转义字符、
+长输入与性能（20 万字符输入、经典回溯杀手 pattern）、带位置的非法 pattern
+报错，以及一组固定参考结果对照表（`REFERENCE`）。全部通过时退出码为 0，
+任一失败则为 1。
+
+也可以临时评估单个 pattern：
+
+```bash
+cargo run --bin verify_regex -- '(a|b)*abb' 'xxababb'
+# pattern:     "(a|b)*abb"
+# input:       "xxababb"
+# full match:  false
+# search:      match at [2, 7)
+```
+
+## 库用法
+
+```rust
+use local_regex::Regex;
+
+let re = Regex::new(r"\d+(\.\d+)?")?;   // 解析 + 编译，错误带位置
+assert!(re.is_full_match("3.14"));      // full match
+assert!(!re.is_full_match("x3.14"));
+assert_eq!(re.search("pi=3.14;"), Some((3, 7))); // search
+```
